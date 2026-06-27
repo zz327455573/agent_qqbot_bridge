@@ -23,12 +23,40 @@ import glob
 from typing import Optional, Dict, Any
 from pathlib import Path
 
-# ================= 配置区 =================
-APP_ID = "1903830759"
-CLIENT_SECRET = "RyW5eEoP0cErU8nS8oVCucL4oZK6sfSG"
-MASTER_OPENID = "FF86A54C2DFDD5A7E7B18DE4BCA2DB63"
+# ================= 环境与配置加载 =================
+def load_env(env_path: str = ".env"):
+    """极简的本地 .env 解析函数，避免依赖外部 python-dotenv 库"""
+    paths = [
+        Path(env_path),
+        Path(__file__).parent / env_path,
+        Path("/root/agy_workspace/scripts/.env"),
+        Path("/root/.env")
+    ]
+    for p in paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, val = line.split("=", 1)
+                            os.environ[key.strip()] = val.strip().strip('"').strip("'")
+                break
+            except Exception:
+                pass
 
-TMUX_SESSION = "0"
+# 执行配置加载
+load_env()
+
+# ================= 配置区 =================
+# 优先从环境变量 (.env) 中读取，无默认值以防开源泄密
+APP_ID = os.environ.get("APP_ID", "")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
+MASTER_OPENID = os.environ.get("MASTER_OPENID", "")
+
+TMUX_SESSION = os.environ.get("TMUX_SESSION", "0")
 API_BASE = "https://api.sgroup.qq.com"
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 GATEWAY_URL_PATH = "/gateway"
@@ -111,23 +139,30 @@ def strip_prompt_lines(text: str) -> str:
 
 
 async def send_to_agy(message: str):
-    escaped = message.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
-    cmd = f'tmux send-keys -t {TMUX_SESSION} "{escaped}" Enter'
-    proc = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # 发送正式消息前，先模拟按 Escape 键强行退出可能存在的 PAGER 或弹窗，使终端归位到输入状态
+    proc_esc = await asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
     )
-    await proc.communicate()
+    await proc_esc.communicate()
+    await asyncio.sleep(0.5)
+    
+    # 直接使用 create_subprocess_exec 投递消息，避免多行和引号被 shell 错误解析导致挂起
+    proc_msg = await asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", TMUX_SESSION, message, ""
+    )
+    await proc_msg.communicate()
+    await asyncio.sleep(0.1)
+    
+    # 发送回车以执行
+    proc_enter = await asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
+    )
+    await proc_enter.communicate()
     logger.info(f"[Bridge -> AGY] {message[:100]}")
 
 
-async def wait_for_agy_response(timeout=300) -> str:
-    """等待 AGY 回复，同时监控审批 TUI。
-
-    正常回复：从 AGY brain transcript.jsonl 读取 PLANNER_RESPONSE
-    审批 TUI ：tmux capture-pane 检测 → 返回 __APPROVAL_REQUIRED__
-    """
+async def wait_for_agy_response(timeout=300, user_openid: str = "", group_openid: str = "", reply_to: Optional[str] = None) -> str:
+    """等待 AGY 回复（从 transcript.jsonl 读取，并带有极简的 st_size 超时活动探测与进度广播）。"""
     transcript = _get_transcript_path()
     if not transcript:
         return "[AGY: 找不到 transcript 文件]"
@@ -137,52 +172,43 @@ async def wait_for_agy_response(timeout=300) -> str:
     except FileNotFoundError:
         return "[AGY: transcript 文件不存在]"
 
+    async def send_status_update(content: str):
+        if group_openid:
+            await send_group_message_rest(group_openid, content, reply_to=reply_to)
+        elif user_openid:
+            await send_message_rest(user_openid, content)
+
     start = time.time()
+    last_push_time = time.time()
+    last_activity_time = time.time()
+    last_size = watermark
 
     while time.time() - start < timeout:
         await asyncio.sleep(0.5)
 
-        # 1. 检测审批 TUI（读终端）
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "capture-pane", "-t", TMUX_SESSION, "-p",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        pane = clean_ansi(stdout.decode("utf-8", errors="replace"))
-        if is_permission_prompt(pane):
-            # 先检查transcript有没有新内容——有的话说明AGY已经在处理了
-            try:
-                current_size = Path(transcript).stat().st_size
-                if current_size > watermark:
-                    # transcript有新内容，审批已自动通过，继续读回复
-                    continue
-            except:
-                pass
-            # transcript没动，再走轮询等TUI消失逻辑
-            for _ in range(20):  # 每 0.5s check 一次，最多 10 秒
-                await asyncio.sleep(0.5)
-                proc2 = await asyncio.create_subprocess_exec(
-                    "tmux", "capture-pane", "-t", TMUX_SESSION, "-p",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout2, _ = await proc2.communicate()
-                pane2 = clean_ansi(stdout2.decode("utf-8", errors="replace"))
-                if not is_permission_prompt(pane2):
-                    # TUI 已消失，自动通过了，继续等 transcript
-                    break
-            else:
-                # 10 秒后 TUI 还在，才是真正需要用户审批
-                return "__APPROVAL_REQUIRED__"
-            continue
-
-        # 2. 检测 transcript 新回复
+        # 检测 transcript 新回复和大小变动
         try:
             current_size = Path(transcript).stat().st_size
         except FileNotFoundError:
             continue
+
+        # 稍微探测：只要日志文件大小变动，就更新活跃时间
+        if current_size != last_size:
+            last_activity_time = time.time()
+            last_size = current_size
+
         if current_size <= watermark:
+            # 极简计时通知（轻量级的进度探测机制）
+            now = time.time()
+            if now - last_push_time >= 60:
+                elapsed = int(now - start)
+                inactive = int(now - last_activity_time)
+                if inactive < 60:
+                    status_msg = f"⏳ 任务执行中（已耗时 {elapsed} 秒），后台日志正在更新，请耐心等候..."
+                else:
+                    status_msg = f"⚠️ 任务已耗时 {elapsed} 秒，后台暂无新动作（可能在深度思考中），请耐心等候..."
+                await send_status_update(status_msg)
+                last_push_time = now
             continue
 
         with open(transcript, 'r', encoding='utf-8', errors='replace') as f:
@@ -211,20 +237,14 @@ async def wait_for_agy_response(timeout=300) -> str:
 
         watermark = current_size
 
-    return "[AGY 超时无回复]"
+    # 超时退出，不发送 Ctrl+C，引导用户选择终止
+    elapsed = int(time.time() - start)
+    return f"⚠️ 任务已执行超过 {elapsed} 秒（5分钟），仍在后台继续。如果您需要强行结束它，请发送 [/stop]；否则可以不予理会，让它继续运行。"
 
 
 def is_permission_prompt(text: str) -> bool:
-    """检测 AGY CLI 终端审批 TUI 是否出现。只检查末尾10行，避免历史回复误判。"""
-    lines = text.splitlines()
-    if len(lines) > 10:
-        text = "\n".join(lines[-10:])
-    markers = [
-        "Requesting permission for:",
-        "Do you want to proceed?",
-        "↑/↓ Navigate · tab Amend",
-    ]
-    return any(m in text for m in markers)
+    """（保留占位）物理 TUI 审批已彻底淘汰，移交底层 Hook 接管。"""
+    return False
 
 
 async def send_message_rest(user_openid: str, content: str) -> bool:
@@ -533,15 +553,40 @@ async def handle_group_message(d: dict, event_type: str):
 
     if cleaned_content.lower() in ["/new", "/reset", "/清空", "/新对话"]:
         logger.info("[Group Recv] New session command received")
-        await send_to_agy("/new")
-        reply = "✅ AGY 会话已重置，开始新对话。"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
+        )
+        await proc.communicate()
+        await asyncio.sleep(1)
+        proc2 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "q", ""
+        )
+        await proc2.communicate()
+        await asyncio.sleep(1)
+        cmd = f"script -q -c 'agy --dangerously-skip-permissions' /dev/null"
+        proc3 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
+        )
+        await proc3.communicate()
+        await asyncio.sleep(3)
+        
+        proc4 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
+        )
+        await proc4.communicate()
+        await asyncio.sleep(1)
+        
+        reply = "✅ 已开启新会话，上下文已清空并自动关闭初始验证弹窗。"
         await send_group_message_rest(group_openid, reply, reply_to=msg_id)
         return
 
     if cleaned_content.lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Group Recv] Stop command received")
-        await send_to_agy("/new")
-        reply = "🛑 已重置 AGY 会话。"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
+        )
+        await proc.communicate()
+        reply = "⛔ 已发送终止信号。"
         await send_group_message_rest(group_openid, reply, reply_to=msg_id)
         return
 
@@ -566,13 +611,7 @@ async def handle_group_message(d: dict, event_type: str):
     try:
         await send_group_message_rest(group_openid, "⏳ AGY 正在思考...", reply_to=msg_id)
         await send_to_agy(prompt_to_send)
-        reply = await wait_for_agy_response()
-        if reply == "__APPROVAL_REQUIRED__":
-            # 重新 capture 获取审批内容，有按钮卡片
-            proc = await asyncio.create_subprocess_exec("tmux", "capture-pane", "-t", TMUX_SESSION, "-p", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await proc.communicate()
-            pane_content = clean_ansi(stdout.decode("utf-8", errors="replace"))
-            reply = strip_prompt_lines(pane_content)
+        reply = await wait_for_agy_response(timeout=300, group_openid=group_openid, reply_to=msg_id)
         if not reply:
             reply = "[AGY 无回复]"
     except Exception as e:
@@ -618,15 +657,40 @@ async def handle_c2c_message(d: dict):
 
     if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
         logger.info("[Recv] New session command received")
-        await send_to_agy("/new")
-        reply = "✅ AGY 会话已重置，开始新对话。"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
+        )
+        await proc.communicate()
+        await asyncio.sleep(1)
+        proc2 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "q", ""
+        )
+        await proc2.communicate()
+        await asyncio.sleep(1)
+        cmd = f"script -q -c 'agy --dangerously-skip-permissions' /dev/null"
+        proc3 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
+        )
+        await proc3.communicate()
+        await asyncio.sleep(3)
+        
+        proc4 = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
+        )
+        await proc4.communicate()
+        await asyncio.sleep(1)
+        
+        reply = "✅ 已开启新会话，上下文已清空并自动关闭初始验证弹窗。"
         await send_message_rest(user_openid, reply)
         return
 
     if content.strip().lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Recv] Stop command received")
-        await send_to_agy("/new")
-        reply = "🛑 已重置 AGY 会话。"
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
+        )
+        await proc.communicate()
+        reply = "⛔ 已发送终止信号。"
         await send_message_rest(user_openid, reply)
         return
 
@@ -640,12 +704,7 @@ async def handle_c2c_message(d: dict):
     try:
         await send_message_rest(user_openid, "⏳ AGY 正在思考...")
         await send_to_agy(content)
-        reply = await wait_for_agy_response()
-        if reply == "__APPROVAL_REQUIRED__":
-            proc = await asyncio.create_subprocess_exec("tmux", "capture-pane", "-t", TMUX_SESSION, "-p", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await proc.communicate()
-            pane_content = clean_ansi(stdout.decode("utf-8", errors="replace"))
-            reply = strip_prompt_lines(pane_content)
+        reply = await wait_for_agy_response(timeout=300, user_openid=user_openid)
         if not reply:
             reply = "[AGY 无回复]"
     except Exception as e:

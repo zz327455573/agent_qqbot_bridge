@@ -1,0 +1,12 @@
+.env
+**/.env
+logs/
+**/logs/
+agy-sessions/
+**/agy-sessions/
+*.log
+**/*.log
+.pm2/
+**/.pm2/
+*.pyc
+**/__pycache__/
