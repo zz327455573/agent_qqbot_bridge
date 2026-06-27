@@ -836,80 +836,71 @@ async def _heartbeat_sender(ws, interval: float):
 async def event_loop(ws):
     global _session_id, _last_seq, _running, _ws, heartbeat_task
     _ws = ws
-    backoff_idx = 0
     heartbeat_interval = HEARTBEAT_INTERVAL
     heartbeat_task = None
 
     heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, heartbeat_interval))
 
-    while _running:
-        try:
-            while _running and ws and not ws.closed:
-                msg = await ws.receive()
+    try:
+        while _running and ws and not ws.closed:
+            msg = await ws.receive()
 
-                if msg.type == 1:
-                    try:
-                        payload = json.loads(msg.data)
-                    except json.JSONDecodeError:
-                        logger.warning(f"JSON parse error: {msg.data[:100]}")
-                        continue
+            if msg.type == 1:
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    logger.warning(f"JSON parse error: {msg.data[:100]}")
+                    continue
 
-                    op = payload.get("op")
-                    t = payload.get("t")
-                    s = payload.get("s")
-                    d = payload.get("d")
+                op = payload.get("op")
+                t = payload.get("t")
+                s = payload.get("s")
+                d = payload.get("d")
 
-                    if isinstance(s, int) and (_last_seq is None or s > _last_seq):
-                        _last_seq = s
+                if isinstance(s, int) and (_last_seq is None or s > _last_seq):
+                    _last_seq = s
 
-                    if op == 10:
-                        d_data = d if isinstance(d, dict) else {}
-                        interval_ms = d_data.get("heartbeat_interval", 30000)
-                        heartbeat_interval = interval_ms / 1000.0 * 0.8
-                        logger.info(f"Hello recv, heartbeat={heartbeat_interval:.1f}s")
-                        if _session_id and _last_seq is not None:
-                            await send_resume(ws)
-                        else:
-                            await send_identify(ws)
-                        continue
+                if op == 10:
+                    d_data = d if isinstance(d, dict) else {}
+                    interval_ms = d_data.get("heartbeat_interval", 30000)
+                    heartbeat_interval = interval_ms / 1000.0 * 0.8
+                    logger.info(f"Hello recv, heartbeat={heartbeat_interval:.1f}s")
+                    if _session_id and _last_seq is not None:
+                        await send_resume(ws)
+                    else:
+                        await send_identify(ws)
+                    continue
 
-                    if op == 0 and t:
-                        logger.info(f"[WS Dispatch] event_type={t}")
-                        if t == "READY":
-                            if isinstance(d, dict):
-                                global _bot_openid
-                                _session_id = d.get("session_id")
-                                user = d.get("user") if isinstance(d.get("user"), dict) else {}
-                                _bot_openid = str(user.get("id", ""))
-                                logger.info(f"READY, session_id={_session_id}, bot_openid={_bot_openid}")
-                        elif t == "RESUMED":
-                            logger.info("Session resumed")
-                        elif t == "C2C_MESSAGE_CREATE":
-                            task = asyncio.create_task(handle_c2c_message(d))
-                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                        elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
-                            task = asyncio.create_task(handle_group_message(d, t))
-                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                        elif t == "INTERACTION_CREATE":
-                            task = asyncio.create_task(handle_interaction(d))
-                            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                        else:
-                            logger.debug(f"Unhandled event: {t}")
-                        continue
+                if op == 0 and t:
+                    logger.info(f"[WS Dispatch] event_type={t}")
+                    if t == "READY":
+                        if isinstance(d, dict):
+                            global _bot_openid
+                            _session_id = d.get("session_id")
+                            user = d.get("user") if isinstance(d.get("user"), dict) else {}
+                            _bot_openid = str(user.get("id", ""))
+                            logger.info(f"READY, session_id={_session_id}, bot_openid={_bot_openid}")
+                    elif t == "RESUMED":
+                        logger.info("Session resumed")
+                    elif t == "C2C_MESSAGE_CREATE":
+                        task = asyncio.create_task(handle_c2c_message(d))
+                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                    elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+                        task = asyncio.create_task(handle_group_message(d, t))
+                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                    elif t == "INTERACTION_CREATE":
+                        task = asyncio.create_task(handle_interaction(d))
+                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                    else:
+                        logger.debug(f"Unhandled event: {t}")
+                    continue
 
-                elif msg.type == 9:
-                    logger.warning("WS close received")
-                    break
-
-        except Exception as e:
-            logger.error(f"Event loop error: {e}")
-            if _running:
-                backoff = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
-                logger.info(f"Reconnecting in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff_idx += 1
-            else:
+            elif msg.type == 9:
+                logger.warning("WS close received")
                 break
+
+    except Exception as e:
+        logger.error(f"Event loop error: {e}")
 
 
 async def main():
