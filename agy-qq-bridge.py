@@ -5,7 +5,8 @@ agy-qq-bridge.py — AGY tmux 常驻进程桥接 QQ
 
 流程:
   QQ 消息 → 桥接脚本 → tmux send-keys -t 0 "消息" Enter
-  AGY 思考 → tmux capture-pane -t 0 -p → 清洗 ANSI → 推回 QQ
+  AGY 回复 → 读取 AGY brain transcript.jsonl (PLANNER_RESPONSE)
+  审批TUI → tmux capture-pane 检测 → QQ 推送审批卡片
 
 启动: python3 /root/agy_workspace/scripts/agy-qq-bridge.py
 依赖: pip install aiohttp httpx
@@ -18,7 +19,9 @@ import sys
 import time
 import uuid
 import logging
+import glob
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 # ================= 配置区 =================
 APP_ID = "1903830759"
@@ -34,10 +37,6 @@ CONNECT_TIMEOUT = 20
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
 HEARTBEAT_INTERVAL = 15.0
-
-AGY_READ_INTERVAL = 0.5
-AGY_IDLE_TIMEOUT = 3.0
-AGY_MAX_WAIT = 300
 # ==========================================
 
 os.makedirs("/root/agy_workspace/logs", exist_ok=True)
@@ -67,10 +66,24 @@ heartbeat_task = None
 _processing = False
 _current_approval_key = None
 
+BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
+_LATEST_TRANSCRIPT = None
+
+
+def _get_transcript_path() -> str:
+    global _LATEST_TRANSCRIPT
+    if _LATEST_TRANSCRIPT:
+        return _LATEST_TRANSCRIPT
+    pattern = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
+    paths = glob.glob(pattern)
+    if not paths:
+        return ""
+    _LATEST_TRANSCRIPT = max(paths, key=os.path.getmtime)
+    return _LATEST_TRANSCRIPT
+
 
 def clean_ansi(text: str) -> str:
     text = ANSI_ESCAPE.sub('', text)
-    # 过滤非打印控制字符（保留换行\n和制表\t）
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     lines = text.split('\n')
     cleaned = []
@@ -89,20 +102,12 @@ def strip_prompt_lines(text: str) -> str:
             continue
         if '? for shortcuts' in line:
             continue
+        if ('Gemini' in line or 'Antigravity' in line) and 'for shortcuts' in line:
+            continue
         if not line.strip():
             continue
         result.append(line)
     return '\n'.join(result).strip()
-
-
-async def read_agy_output() -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-500",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
-    return stdout.decode("utf-8", errors="replace")
 
 
 async def send_to_agy(message: str):
@@ -117,90 +122,103 @@ async def send_to_agy(message: str):
     logger.info(f"[Bridge -> AGY] {message[:100]}")
 
 
-# 水位线比较用的分隔符，已废弃（保留兼容）
-# _SEPARATOR_RE = re.compile(r'^─{10,}$')
+async def wait_for_agy_response(timeout=300) -> str:
+    """等待 AGY 回复，同时监控审批 TUI。
 
-
-def _extract_diff(watermark: str, current: str) -> str:
-    """从当前 buffer 中提取水位线之后的新增内容。
-
-    tmux 历史缓冲区（-S -500）是滚动窗口。AGY 输出新内容时，
-    旧行从顶部滚出，新行在底部追加。
-
-    水位线 = 发送消息前的 buffer（最近 500 行）。
-    找重叠：水位线的尾部在最新 buffer 头部出现了多少行，
-    重叠之后的部分 = AGY 新输出的内容。
+    正常回复：从 AGY brain transcript.jsonl 读取 PLANNER_RESPONSE
+    审批 TUI ：tmux capture-pane 检测 → 返回 __APPROVAL_REQUIRED__
     """
-    w_lines = watermark.split('\n')
-    c_lines = current.split('\n')
+    transcript = _get_transcript_path()
+    if not transcript:
+        return "[AGY: 找不到 transcript 文件]"
 
-    max_check = min(len(w_lines), len(c_lines))
-    for n in range(max_check, -1, -1):
-        suffix = w_lines[-n:] if n > 0 else []
-        prefix = c_lines[:n]
-        if suffix == prefix:
-            new_lines = c_lines[n:]
-            return '\n'.join(new_lines).strip()
+    try:
+        watermark = Path(transcript).stat().st_size
+    except FileNotFoundError:
+        return "[AGY: transcript 文件不存在]"
 
-    # 没有重叠（缓冲区整个被刷新），返回全部内容
-    return '\n'.join(c_lines).strip()
+    start = time.time()
 
+    while time.time() - start < timeout:
+        await asyncio.sleep(0.5)
 
-async def wait_for_agy_response(watermark_text: str) -> str:
-    """等待 AGY 完成回复，返回水位线之后的新增内容。
-
-    完成检测：spinner 字符消失 + buffer 尾部出现 > prompt。
-    """
-    start_time = time.time()
-    last_output = ""
-
-    SPINNER_CHARS = set('⣾⣯⣽⣻⢿⡿⣟⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏')
-
-    while time.time() - start_time < AGY_MAX_WAIT:
-        await asyncio.sleep(AGY_READ_INTERVAL)
-        current = await read_agy_output()
-        cleaned = clean_ansi(current)
-
-        if not cleaned.strip():
+        # 1. 检测审批 TUI（读终端）
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "capture-pane", "-t", TMUX_SESSION, "-p",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        pane = clean_ansi(stdout.decode("utf-8", errors="replace"))
+        if is_permission_prompt(pane):
+            # 先检查transcript有没有新内容——有的话说明AGY已经在处理了
+            try:
+                current_size = Path(transcript).stat().st_size
+                if current_size > watermark:
+                    # transcript有新内容，审批已自动通过，继续读回复
+                    continue
+            except:
+                pass
+            # transcript没动，再走轮询等TUI消失逻辑
+            for _ in range(20):  # 每 0.5s check 一次，最多 10 秒
+                await asyncio.sleep(0.5)
+                proc2 = await asyncio.create_subprocess_exec(
+                    "tmux", "capture-pane", "-t", TMUX_SESSION, "-p",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout2, _ = await proc2.communicate()
+                pane2 = clean_ansi(stdout2.decode("utf-8", errors="replace"))
+                if not is_permission_prompt(pane2):
+                    # TUI 已消失，自动通过了，继续等 transcript
+                    break
+            else:
+                # 10 秒后 TUI 还在，才是真正需要用户审批
+                return "__APPROVAL_REQUIRED__"
             continue
 
-        # 正在生成中 → 跳过
-        if any(c in cleaned for c in SPINNER_CHARS):
+        # 2. 检测 transcript 新回复
+        try:
+            current_size = Path(transcript).stat().st_size
+        except FileNotFoundError:
+            continue
+        if current_size <= watermark:
             continue
 
-        # 检测审批 TUI
-        if is_permission_prompt(cleaned):
-            result = strip_prompt_lines(cleaned)
-            logger.info(f"[AGY -> Approval TUI] {result[:200]}")
-            return result
+        with open(transcript, 'r', encoding='utf-8', errors='replace') as f:
+            f.seek(watermark)
+            new_lines = f.read().splitlines()
 
-        # 检测回复完成：buffer 尾端出现 > prompt
-        lines = cleaned.split('\n')
-        tail = lines[-5:]
-        if any(l.strip() == '>' or l.strip().startswith('> ') for l in tail):
-            result = _extract_diff(watermark_text, cleaned)
-            logger.info(f"[AGY -> Bridge] {result[:200]}")
-            return result
+        for line in new_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
+                content = obj.get("content", "")
+                if isinstance(content, list):
+                    text = "\n".join(
+                        item.get("text", "") for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                else:
+                    text = str(content)
+                if text.strip():
+                    return text.strip()
 
-        last_output = cleaned
+        watermark = current_size
 
-    # 超时兜底
-    if last_output:
-        result = _extract_diff(watermark_text, last_output)
-        logger.warning(f"[AGY -> Bridge (timeout)] {result[:200]}")
-        return result
-    return ""
+    return "[AGY 超时无回复]"
 
 
 def is_permission_prompt(text: str) -> bool:
-    """检测 AGY CLI 终端审批 TUI 是否出现。
-    
-    只匹配 AGY 审批界面的固定特征文本，不会误判正常输出。
-    特征文本来自实际 capture-pane 抓取：
-      - "Requesting permission for:" — TUI 标题
-      - "Do you want to proceed?" — 审批问题
-      - "↑/↓ Navigate · tab Amend" — TUI 导航栏
-    """
+    """检测 AGY CLI 终端审批 TUI 是否出现。只检查末尾10行，避免历史回复误判。"""
+    lines = text.splitlines()
+    if len(lines) > 10:
+        text = "\n".join(lines[-10:])
     markers = [
         "Requesting permission for:",
         "Do you want to proceed?",
@@ -232,74 +250,30 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
                         "buttons": [
                             {
                                 "id": "btn_allow",
-                                "render_data": {
-                                    "label": "✅ 允许一次",
-                                    "visited_label": "已允许",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow"
-                                }
+                                "render_data": {"label": "✅ 允许一次", "visited_label": "已允许", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow"},
                             },
                             {
                                 "id": "btn_allow_similar",
-                                "render_data": {
-                                    "label": "⚡ 本次允许同类",
-                                    "visited_label": "已允许同类",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow_similar"
-                                }
-                            }
+                                "render_data": {"label": "⚡ 本次允许同类", "visited_label": "已允许同类", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_similar"},
+                            },
                         ]
                     },
                     {
                         "buttons": [
                             {
                                 "id": "btn_allow_always",
-                                "render_data": {
-                                    "label": "🛡️ 永久允许",
-                                    "visited_label": "已永久允许",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow_always"
-                                }
+                                "render_data": {"label": "🛡️ 永久允许", "visited_label": "已永久允许", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_always"},
                             },
                             {
                                 "id": "btn_deny",
-                                "render_data": {
-                                    "label": "❌ 拒绝",
-                                    "visited_label": "已拒绝",
-                                    "style": 0
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:deny"
-                                }
-                            }
+                                "render_data": {"label": "❌ 拒绝", "visited_label": "已拒绝", "style": 0},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:deny"},
+                            },
                         ]
-                    }
+                    },
                 ]
             }
         }
@@ -343,74 +317,30 @@ async def send_group_message_rest(group_openid: str, content: str, reply_to: Opt
                         "buttons": [
                             {
                                 "id": "btn_allow",
-                                "render_data": {
-                                    "label": "✅ 允许一次",
-                                    "visited_label": "已允许",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow"
-                                }
+                                "render_data": {"label": "✅ 允许一次", "visited_label": "已允许", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow"},
                             },
                             {
                                 "id": "btn_allow_similar",
-                                "render_data": {
-                                    "label": "⚡ 本次允许同类",
-                                    "visited_label": "已允许同类",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow_similar"
-                                }
-                            }
+                                "render_data": {"label": "⚡ 本次允许同类", "visited_label": "已允许同类", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_similar"},
+                            },
                         ]
                     },
                     {
                         "buttons": [
                             {
                                 "id": "btn_allow_always",
-                                "render_data": {
-                                    "label": "🛡️ 永久允许",
-                                    "visited_label": "已永久允许",
-                                    "style": 1
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:allow_always"
-                                }
+                                "render_data": {"label": "🛡️ 永久允许", "visited_label": "已永久允许", "style": 1},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_always"},
                             },
                             {
                                 "id": "btn_deny",
-                                "render_data": {
-                                    "label": "❌ 拒绝",
-                                    "visited_label": "已拒绝",
-                                    "style": 0
-                                },
-                                "action": {
-                                    "type": 2,
-                                    "permission": {
-                                        "type": 2,
-                                        "specify_user_ids": [MASTER_OPENID]
-                                    },
-                                    "data": f"approve:{_current_approval_key}:deny"
-                                }
-                            }
+                                "render_data": {"label": "❌ 拒绝", "visited_label": "已拒绝", "style": 0},
+                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:deny"},
+                            },
                         ]
-                    }
+                    },
                 ]
             }
         }
@@ -601,6 +531,13 @@ async def handle_group_message(d: dict, event_type: str):
             asyncio.create_task(handle_approval_action(key, decision, member_openid, group_openid, msg_id))
             return
 
+    if cleaned_content.lower() in ["/new", "/reset", "/清空", "/新对话"]:
+        logger.info("[Group Recv] New session command received")
+        await send_to_agy("/new")
+        reply = "✅ AGY 会话已重置，开始新对话。"
+        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
+        return
+
     if cleaned_content.lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Group Recv] Stop command received")
         await send_to_agy("/new")
@@ -628,9 +565,14 @@ async def handle_group_message(d: dict, event_type: str):
     _processing = True
     try:
         await send_group_message_rest(group_openid, "⏳ AGY 正在思考...", reply_to=msg_id)
-        watermark = clean_ansi(await read_agy_output())
         await send_to_agy(prompt_to_send)
-        reply = await wait_for_agy_response(watermark)
+        reply = await wait_for_agy_response()
+        if reply == "__APPROVAL_REQUIRED__":
+            # 重新 capture 获取审批内容，有按钮卡片
+            proc = await asyncio.create_subprocess_exec("tmux", "capture-pane", "-t", TMUX_SESSION, "-p", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await proc.communicate()
+            pane_content = clean_ansi(stdout.decode("utf-8", errors="replace"))
+            reply = strip_prompt_lines(pane_content)
         if not reply:
             reply = "[AGY 无回复]"
     except Exception as e:
@@ -674,6 +616,13 @@ async def handle_c2c_message(d: dict):
             asyncio.create_task(handle_approval_action(key, decision, user_openid, None, msg_id))
             return
 
+    if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
+        logger.info("[Recv] New session command received")
+        await send_to_agy("/new")
+        reply = "✅ AGY 会话已重置，开始新对话。"
+        await send_message_rest(user_openid, reply)
+        return
+
     if content.strip().lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Recv] Stop command received")
         await send_to_agy("/new")
@@ -690,9 +639,13 @@ async def handle_c2c_message(d: dict):
     _processing = True
     try:
         await send_message_rest(user_openid, "⏳ AGY 正在思考...")
-        watermark = clean_ansi(await read_agy_output())
         await send_to_agy(content)
-        reply = await wait_for_agy_response(watermark)
+        reply = await wait_for_agy_response()
+        if reply == "__APPROVAL_REQUIRED__":
+            proc = await asyncio.create_subprocess_exec("tmux", "capture-pane", "-t", TMUX_SESSION, "-p", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await proc.communicate()
+            pane_content = clean_ansi(stdout.decode("utf-8", errors="replace"))
+            reply = strip_prompt_lines(pane_content)
         if not reply:
             reply = "[AGY 无回复]"
     except Exception as e:
@@ -709,7 +662,7 @@ async def handle_c2c_message(d: dict):
 
 async def handle_approval_action(key: str, decision: str, user_openid: str, group_openid: Optional[str] = None, msg_id: Optional[str] = None) -> bool:
     global _current_approval_key, _processing
-    
+
     if not _current_approval_key or key != _current_approval_key:
         logger.warning(f"Key mismatch: received {key}, current is {_current_approval_key}")
         feedback = "⚠️ 审批卡片已失效或非最新请求。"
@@ -718,9 +671,9 @@ async def handle_approval_action(key: str, decision: str, user_openid: str, grou
         else:
             await send_message_rest(user_openid, feedback)
         return False
-        
+
     logger.info(f"Processing approval: decision={decision} for key={key}")
-    
+
     keystroke = None
     if decision == "allow":
         keystroke = "y"
@@ -730,13 +683,13 @@ async def handle_approval_action(key: str, decision: str, user_openid: str, grou
         keystroke = "p"
     elif decision == "deny":
         keystroke = "n"
-        
+
     if not keystroke:
         logger.error(f"Unknown decision type: {decision}")
         return False
-        
+
     _current_approval_key = None
-    
+
     _processing = True
     try:
         feedback = f"✅ 已确认操作：[{decision}]，正在提交执行，请稍候..."
@@ -744,10 +697,11 @@ async def handle_approval_action(key: str, decision: str, user_openid: str, grou
             await send_group_message_rest(group_openid, feedback, reply_to=msg_id)
         else:
             await send_message_rest(user_openid, feedback)
-            
-        watermark = clean_ansi(await read_agy_output())
+
         await send_to_agy(keystroke)
-        reply = await wait_for_agy_response(watermark)
+        reply = await wait_for_agy_response()
+        if reply == "__APPROVAL_REQUIRED__":
+            reply = "⚠️ AGY 正在等待审批，请在终端确认后重新发送消息。"
         if not reply:
             reply = "[AGY 无回复]"
     except Exception as e:
@@ -755,12 +709,12 @@ async def handle_approval_action(key: str, decision: str, user_openid: str, grou
         logger.error(f"Error handling approval action: {e}")
     finally:
         _processing = False
-        
+
     if group_openid:
         await send_group_message_rest(group_openid, reply, reply_to=msg_id)
     else:
         await send_message_rest(user_openid, reply)
-        
+
     return True
 
 
@@ -768,7 +722,7 @@ async def handle_interaction(d: dict):
     interaction_id = d.get("id")
     if not interaction_id:
         return
-        
+
     token = await ensure_token()
     client = get_http_client()
     try:
@@ -785,16 +739,16 @@ async def handle_interaction(d: dict):
         logger.info(f"[Interaction] ACK status: {resp.status_code}")
     except Exception as e:
         logger.error(f"[Interaction] ACK exception: {e}")
-        
+
     author = d.get("author") or {}
     user_openid = d.get("user_openid") or author.get("user_openid")
     if not user_openid:
         user_openid = author.get("member_openid")
-        
+
     if user_openid != MASTER_OPENID:
         logger.warning(f"[Interaction] Unauthorized click from {user_openid}")
         return
-        
+
     data_block = d.get("data", {})
     button_data = data_block.get("button_data", "")
     if button_data.startswith("approve:"):
@@ -804,7 +758,6 @@ async def handle_interaction(d: dict):
             decision = parts[2]
             group_openid = d.get("group_openid")
             msg_id = d.get("id")
-            
             asyncio.create_task(handle_approval_action(key, decision, user_openid, group_openid, msg_id))
 
 
@@ -822,7 +775,7 @@ async def _heartbeat_sender(ws, interval: float):
 
 
 async def event_loop(ws):
-    global _session_id, _last_seq, _running, _ws, heartbeat_task, _ws_session
+    global _session_id, _last_seq, _running, _ws, heartbeat_task
     _ws = ws
     backoff_idx = 0
     heartbeat_interval = HEARTBEAT_INTERVAL
