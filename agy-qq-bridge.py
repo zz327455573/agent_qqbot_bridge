@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-agy-qq-bridge.py — AGY tmux 常驻进程桥接 QQ
-架构: QQ官方WS网关 ↔ Python asyncio ↔ tmux send-keys/capture-pane ↔ AGY
-
+agy-qq-bridge.py — AGY tmux 常驻进程直连 C2C 桥接 QQ
+架构: QQ官方WS网关 ↔ Python asyncio ↔ tmux send-keys ↔ AGY
 流程:
   QQ 消息 → 桥接脚本 → tmux send-keys -t 0 "消息" Enter
-  AGY 回复 → 读取 AGY brain transcript.jsonl (PLANNER_RESPONSE)
-  审批TUI → tmux capture-pane 检测 → QQ 推送审批卡片
-
-启动: python3 /root/agy_workspace/scripts/agy-qq-bridge.py
-依赖: pip install aiohttp httpx
+  AGY 回复 → 后台异步循环监听 AGY brain transcript.jsonl 增量推送到 QQ
 """
 import asyncio
 import json
@@ -29,8 +24,7 @@ def load_env(env_path: str = ".env"):
     paths = [
         Path(env_path),
         Path(__file__).parent / env_path,
-        Path("/root/agy_workspace/scripts/.env"),
-        Path("/root/.env")
+        Path.home() / ".env"
     ]
     for p in paths:
         if p.exists():
@@ -51,7 +45,6 @@ def load_env(env_path: str = ".env"):
 load_env()
 
 # ================= 配置区 =================
-# 优先从环境变量 (.env) 中读取，无默认值以防开源泄密
 APP_ID = os.environ.get("APP_ID", "")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 MASTER_OPENID = os.environ.get("MASTER_OPENID", "")
@@ -65,21 +58,24 @@ CONNECT_TIMEOUT = 20
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
 HEARTBEAT_INTERVAL = 15.0
+
+# 路径与命令配置化（支持自定义配置以防本机硬编码）
+BRAIN_DIR = Path(os.environ.get("BRAIN_DIR", str(Path.home() / ".gemini/antigravity-cli/brain")))
+LOG_DIR = Path(os.environ.get("LOG_DIR", str(Path(__file__).parent / "logs")))
+AGY_START_CMD = os.environ.get("AGY_START_CMD", "cd ~ && agy --dangerously-skip-permissions")
 # ==========================================
 
-os.makedirs("/root/agy_workspace/logs", exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/root/agy_workspace/logs/agy-qq-bridge.log", encoding="utf-8"),
+        logging.FileHandler(LOG_DIR / "agy-qq-bridge.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("agy_qq_bridge")
-
-ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 _access_token: Optional[str] = None
 _token_expires_at: float = 0.0
@@ -91,69 +87,49 @@ _running = False
 _last_msg_id: Optional[str] = None
 _bot_openid: str = ""
 heartbeat_task = None
-_processing = False
-_current_approval_key = None
 
-BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
-_LATEST_TRANSCRIPT = None
+# === 异步监听状态变量 ===
+_last_log_size = 0
+_current_log_path = None
 
 
-def _get_transcript_path() -> str:
-    global _LATEST_TRANSCRIPT
-    if _LATEST_TRANSCRIPT:
-        return _LATEST_TRANSCRIPT
+def find_latest_transcript(min_mtime: float) -> Optional[Path]:
+    """获取在 min_mtime 之后新修改/创建的最新 transcript.jsonl 日志文件"""
     pattern = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
     paths = glob.glob(pattern)
     if not paths:
-        return ""
-    _LATEST_TRANSCRIPT = max(paths, key=os.path.getmtime)
-    return _LATEST_TRANSCRIPT
-
-
-def clean_ansi(text: str) -> str:
-    text = ANSI_ESCAPE.sub('', text)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    lines = text.split('\n')
-    cleaned = []
-    for line in lines:
-        if '\r' in line:
-            line = line.split('\r')[-1]
-        cleaned.append(line)
-    return '\n'.join(cleaned).strip()
-
-
-def strip_prompt_lines(text: str) -> str:
-    lines = text.split('\n')
-    result = []
-    for line in lines:
-        if line.strip().startswith('─' * 10):
+        return None
+    paths_with_mtime = []
+    for p in paths:
+        try:
+            mtime = os.path.getmtime(p)
+            if mtime >= min_mtime:
+                paths_with_mtime.append((Path(p), mtime))
+        except OSError:
             continue
-        if '? for shortcuts' in line:
-            continue
-        if ('Gemini' in line or 'Antigravity' in line) and 'for shortcuts' in line:
-            continue
-        if not line.strip():
-            continue
-        result.append(line)
-    return '\n'.join(result).strip()
+    if not paths_with_mtime:
+        return None
+    paths_with_mtime.sort(key=lambda x: x[1], reverse=True)
+    return paths_with_mtime[0][0]
 
 
 async def send_to_agy(message: str):
-    # 发送正式消息前，先模拟按 Escape 键强行退出可能存在的 PAGER 或弹窗，使终端归位到输入状态
+    """发送消息给 tmux 中的 AGY"""
+    # 模拟按 Escape 强退可能卡在 TUI 或 PAGER 的状态
     proc_esc = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
     )
     await proc_esc.communicate()
     await asyncio.sleep(0.5)
     
-    # 直接使用 create_subprocess_exec 投递消息，避免多行和引号被 shell 错误解析导致挂起
+    # 写入消息
     proc_msg = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", TMUX_SESSION, message, ""
     )
     await proc_msg.communicate()
     await asyncio.sleep(0.1)
     
-    # 发送回车以执行
+    # 按回车执行
     proc_enter = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
     )
@@ -161,60 +137,58 @@ async def send_to_agy(message: str):
     logger.info(f"[Bridge -> AGY] {message[:100]}")
 
 
-async def wait_for_agy_response(timeout=300, user_openid: str = "", group_openid: str = "", reply_to: Optional[str] = None) -> str:
-    """等待 AGY 回复（从 transcript.jsonl 读取，并带有极简的 st_size 超时活动探测与进度广播）。"""
-    transcript = _get_transcript_path()
-    if not transcript:
-        return "[AGY: 找不到 transcript 文件]"
-
-    try:
-        watermark = Path(transcript).stat().st_size
-    except FileNotFoundError:
-        return "[AGY: transcript 文件不存在]"
-
-    async def send_status_update(content: str):
-        if group_openid:
-            await send_group_message_rest(group_openid, content, reply_to=reply_to)
-        elif user_openid:
-            await send_message_rest(user_openid, content)
-
-    start = time.time()
-    last_push_time = time.time()
-    last_activity_time = time.time()
-    last_size = watermark
-
-    while time.time() - start < timeout:
-        await asyncio.sleep(0.5)
-
-        # 检测 transcript 新回复和大小变动
+async def log_listener():
+    """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
+    global _current_log_path, _last_log_size
+    
+    # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
+    init_log = find_latest_transcript(time.time() - 86400.0)
+    if init_log:
+        _current_log_path = init_log
         try:
-            current_size = Path(transcript).stat().st_size
+            _last_log_size = init_log.stat().st_size
+        except OSError:
+            _last_log_size = 0
+        logger.info(f"[Listener] Bound to existing active log: {_current_log_path} (size={_last_log_size})")
+
+    while _running:
+        await asyncio.sleep(0.5)
+        
+        # 1. 动态探测是否有新修改的文件诞生（比如重置会话拉起新 UUID 目录）
+        try:
+            latest_log = find_latest_transcript(time.time() - 86400.0)
+            if latest_log and (not _current_log_path or latest_log != _current_log_path):
+                _current_log_path = latest_log
+                _last_log_size = 0  # 绑定全新文件，从头读起
+                logger.info(f"[Listener] Switched to newer active log: {_current_log_path}")
+        except Exception as e:
+            logger.error(f"[Listener] Scan error: {e}")
+
+        if not _current_log_path:
+            continue
+
+        # 2. 检测大小变动
+        try:
+            curr_size = _current_log_path.stat().st_size
         except FileNotFoundError:
+            _current_log_path = None
             continue
 
-        # 稍微探测：只要日志文件大小变动，就更新活跃时间
-        if current_size != last_size:
-            last_activity_time = time.time()
-            last_size = current_size
-
-        if current_size <= watermark:
-            # 极简计时通知（轻量级的进度探测机制）
-            now = time.time()
-            if now - last_push_time >= 60:
-                elapsed = int(now - start)
-                inactive = int(now - last_activity_time)
-                if inactive < 60:
-                    status_msg = f"⏳ 任务执行中（已耗时 {elapsed} 秒），后台日志正在更新，请耐心等候..."
-                else:
-                    status_msg = f"⚠️ 任务已耗时 {elapsed} 秒，后台暂无新动作（可能在深度思考中），请耐心等候..."
-                await send_status_update(status_msg)
-                last_push_time = now
+        if curr_size <= _last_log_size:
             continue
 
-        with open(transcript, 'r', encoding='utf-8', errors='replace') as f:
-            f.seek(watermark)
-            new_lines = f.read().splitlines()
+        # 3. 增量读取新行
+        try:
+            with open(_current_log_path, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(_last_log_size)
+                new_lines = f.read().splitlines()
+        except OSError:
+            continue
 
+        # 更新指针
+        _last_log_size = curr_size
+
+        # 4. 解析增量行
         for line in new_lines:
             line = line.strip()
             if not line:
@@ -223,6 +197,8 @@ async def wait_for_agy_response(timeout=300, user_openid: str = "", group_openid
                 obj = json.loads(line)
             except Exception:
                 continue
+            
+            # 只捕获模型返回的最终回复内容
             if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
                 content = obj.get("content", "")
                 if isinstance(content, list):
@@ -232,23 +208,14 @@ async def wait_for_agy_response(timeout=300, user_openid: str = "", group_openid
                     )
                 else:
                     text = str(content)
-                if text.strip():
-                    return text.strip()
-
-        watermark = current_size
-
-    # 超时退出，不发送 Ctrl+C，引导用户选择终止
-    elapsed = int(time.time() - start)
-    return f"⚠️ 任务已执行超过 {elapsed} 秒（5分钟），仍在后台继续。如果您需要强行结束它，请发送 [/stop]；否则可以不予理会，让它继续运行。"
-
-
-def is_permission_prompt(text: str) -> bool:
-    """（保留占位）物理 TUI 审批已彻底淘汰，移交底层 Hook 接管。"""
-    return False
+                text = text.strip()
+                if text:
+                    logger.info(f"[Listener -> QQ] Broadcasting response: {text[:100]}")
+                    await send_message_rest(MASTER_OPENID, text)
 
 
 async def send_message_rest(user_openid: str, content: str) -> bool:
-    global _current_approval_key
+    """给指定用户发送 C2C 消息"""
     token = await ensure_token()
     client = get_http_client()
     headers = {
@@ -259,44 +226,6 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
     msg_seq = _next_msg_seq(user_openid)
     display_content = content[:3990] + "\n\n... (已截断)" if len(content) > 4000 else content
     body = {"markdown": {"content": display_content}, "msg_type": 2, "msg_seq": msg_seq}
-
-    if is_permission_prompt(content):
-        _current_approval_key = uuid.uuid4().hex[:16]
-        logger.info(f"Generated approval key: {_current_approval_key} for user: {user_openid}")
-        body["keyboard"] = {
-            "content": {
-                "rows": [
-                    {
-                        "buttons": [
-                            {
-                                "id": "btn_allow",
-                                "render_data": {"label": "✅ 允许一次", "visited_label": "已允许", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow"},
-                            },
-                            {
-                                "id": "btn_allow_similar",
-                                "render_data": {"label": "⚡ 本次允许同类", "visited_label": "已允许同类", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_similar"},
-                            },
-                        ]
-                    },
-                    {
-                        "buttons": [
-                            {
-                                "id": "btn_allow_always",
-                                "render_data": {"label": "🛡️ 永久允许", "visited_label": "已永久允许", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_always"},
-                            },
-                            {
-                                "id": "btn_deny",
-                                "render_data": {"label": "❌ 拒绝", "visited_label": "已拒绝", "style": 0},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:deny"},
-                            },
-                        ]
-                    },
-                ]
-            }
-        }
 
     try:
         resp = await client.post(
@@ -309,73 +238,6 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Send exception: {e}")
-        return False
-
-
-async def send_group_message_rest(group_openid: str, content: str, reply_to: Optional[str] = None) -> bool:
-    global _current_approval_key
-    token = await ensure_token()
-    client = get_http_client()
-    headers = {
-        "Authorization": f"QQBot {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "AGY-QQ-Bridge/1.0",
-    }
-    msg_seq = _next_msg_seq(group_openid)
-    display_content = content[:3990] + "\n\n... (已截断)" if len(content) > 4000 else content
-    body = {"markdown": {"content": display_content}, "msg_type": 2, "msg_seq": msg_seq}
-    if reply_to:
-        body["msg_id"] = reply_to
-
-    if is_permission_prompt(content):
-        _current_approval_key = uuid.uuid4().hex[:16]
-        logger.info(f"Generated approval key: {_current_approval_key} for group: {group_openid}")
-        body["keyboard"] = {
-            "content": {
-                "rows": [
-                    {
-                        "buttons": [
-                            {
-                                "id": "btn_allow",
-                                "render_data": {"label": "✅ 允许一次", "visited_label": "已允许", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow"},
-                            },
-                            {
-                                "id": "btn_allow_similar",
-                                "render_data": {"label": "⚡ 本次允许同类", "visited_label": "已允许同类", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_similar"},
-                            },
-                        ]
-                    },
-                    {
-                        "buttons": [
-                            {
-                                "id": "btn_allow_always",
-                                "render_data": {"label": "🛡️ 永久允许", "visited_label": "已永久允许", "style": 1},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:allow_always"},
-                            },
-                            {
-                                "id": "btn_deny",
-                                "render_data": {"label": "❌ 拒绝", "visited_label": "已拒绝", "style": 0},
-                                "action": {"type": 2, "permission": {"type": 2, "specify_user_ids": [MASTER_OPENID]}, "data": f"approve:{_current_approval_key}:deny"},
-                            },
-                        ]
-                    },
-                ]
-            }
-        }
-
-    try:
-        resp = await client.post(
-            f"{API_BASE}/v2/groups/{group_openid}/messages",
-            headers=headers, json=body, timeout=30.0,
-        )
-        if resp.status_code >= 400:
-            logger.error(f"Group send failed [{resp.status_code}]: {resp.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"Group send exception: {e}")
         return False
 
 
@@ -471,163 +333,8 @@ def is_duplicate(msg_id: str) -> bool:
     return False
 
 
-GROUP_CONTEXT_CACHE: Dict[str, list] = {}
-
-
-async def handle_group_message(d: dict, event_type: str):
-    global _last_msg_id, _processing, _bot_openid, GROUP_CONTEXT_CACHE
-
-    msg_id = str(d.get("id", ""))
-    logger.info(f"[Group Raw] event={event_type} msg_id={msg_id} group={d.get('group_openid')} content={d.get('content')} mentions={d.get('mentions')}")
-    if not msg_id or is_duplicate(msg_id):
-        return
-
-    group_openid = str(d.get("group_openid", ""))
-    content = str(d.get("content", "")).strip()
-    author = d.get("author") if isinstance(d.get("author"), dict) else {}
-    member_openid = str(author.get("member_openid", ""))
-
-    if not group_openid or not content:
-        return
-
-    sender_name = author.get("nickname") or author.get("username")
-    if not sender_name:
-        sender_name = f"user_{member_openid[-6:]}" if member_openid else "User"
-    msg_line = f"[{sender_name}] {content.strip()}"
-
-    is_mentioned = False
-    my_openid_in_group = ""
-
-    mentions = d.get("mentions") or []
-    for m in mentions:
-        if m.get("is_you") is True:
-            my_openid_in_group = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
-            break
-
-    if event_type == "GROUP_AT_MESSAGE_CREATE":
-        is_mentioned = True
-    elif event_type == "GROUP_MESSAGE_CREATE":
-        if my_openid_in_group:
-            is_mentioned = True
-        elif _bot_openid and mentions:
-            for m in mentions:
-                mid = m.get("member_openid") or m.get("id") or m.get("user_openid") or ""
-                if str(mid) == str(_bot_openid):
-                    is_mentioned = True
-                    break
-
-    if not is_mentioned:
-        if group_openid not in GROUP_CONTEXT_CACHE:
-            GROUP_CONTEXT_CACHE[group_openid] = []
-        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
-        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
-        return
-
-    _last_msg_id = msg_id
-    logger.info(f"[Group Recv] group={group_openid} member={member_openid}: {content[:100]}")
-
-    if member_openid != MASTER_OPENID:
-        logger.info(f"[Group Skip] non-master openid: {member_openid}")
-        if group_openid not in GROUP_CONTEXT_CACHE:
-            GROUP_CONTEXT_CACHE[group_openid] = []
-        GROUP_CONTEXT_CACHE[group_openid].append(msg_line)
-        GROUP_CONTEXT_CACHE[group_openid] = GROUP_CONTEXT_CACHE[group_openid][-100:]
-        return
-
-    cleaned_content = content
-    if my_openid_in_group:
-        cleaned_content = re.sub(rf"<@!?{my_openid_in_group}>", "", cleaned_content).strip()
-    if _bot_openid:
-        cleaned_content = re.sub(rf"<@!?{_bot_openid}>", "", cleaned_content).strip()
-
-    if not cleaned_content:
-        return
-
-    if cleaned_content.startswith("approve:"):
-        parts = cleaned_content.split(":")
-        if len(parts) >= 3:
-            key = parts[1]
-            decision = parts[2]
-            asyncio.create_task(handle_approval_action(key, decision, member_openid, group_openid, msg_id))
-            return
-
-    if cleaned_content.lower() in ["/new", "/reset", "/清空", "/新对话"]:
-        logger.info("[Group Recv] New session command received")
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
-        )
-        await proc.communicate()
-        await asyncio.sleep(1)
-        proc2 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "q", ""
-        )
-        await proc2.communicate()
-        await asyncio.sleep(1)
-        cmd = f"script -q -c 'agy --dangerously-skip-permissions' /dev/null"
-        proc3 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
-        )
-        await proc3.communicate()
-        await asyncio.sleep(3)
-        
-        proc4 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
-        )
-        await proc4.communicate()
-        await asyncio.sleep(1)
-        
-        reply = "✅ 已开启新会话，上下文已清空并自动关闭初始验证弹窗。"
-        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
-        return
-
-    if cleaned_content.lower() in ["/stop", "/停止", "/kill"]:
-        logger.info("[Group Recv] Stop command received")
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
-        )
-        await proc.communicate()
-        reply = "⛔ 已发送终止信号。"
-        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
-        return
-
-    if _processing:
-        await send_group_message_rest(group_openid, "⚠️ 当前已有任务正在执行中，请稍候。", reply_to=msg_id)
-        return
-
-    channel_context = ""
-    if group_openid in GROUP_CONTEXT_CACHE:
-        history_lines = GROUP_CONTEXT_CACHE[group_openid]
-        if history_lines:
-            channel_context = "[Recent group chat context]\n" + "\n".join(history_lines)
-            GROUP_CONTEXT_CACHE[group_openid] = []
-
-    prompt_to_send = cleaned_content
-    if channel_context:
-        prompt_to_send = f"{channel_context}\n\n[New message]\n{cleaned_content}"
-
-    logger.info(f"[QQ Group -> AGY] group={group_openid}: {cleaned_content[:100]}")
-
-    _processing = True
-    try:
-        await send_group_message_rest(group_openid, "⏳ AGY 正在思考...", reply_to=msg_id)
-        await send_to_agy(prompt_to_send)
-        reply = await wait_for_agy_response(timeout=300, group_openid=group_openid, reply_to=msg_id)
-        if not reply:
-            reply = "[AGY 无回复]"
-    except Exception as e:
-        reply = f"[AGY error] {str(e)[:300]}"
-        logger.error(f"Error processing group message: {e}")
-    finally:
-        _processing = False
-
-    logger.info(f"[AGY -> QQ Group] {reply[:200]}")
-    success = await send_group_message_rest(group_openid, reply, reply_to=msg_id)
-    if not success:
-        logger.error("Group reply send failed")
-
-
 async def handle_c2c_message(d: dict):
-    global _last_msg_id, _processing, _bot_openid
+    global _last_msg_id, _bot_openid
 
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
@@ -647,204 +354,63 @@ async def handle_c2c_message(d: dict):
         logger.info(f"[Skip] non-master openid: {user_openid}")
         return
 
-    if content.startswith("approve:"):
-        parts = content.split(":")
-        if len(parts) >= 3:
-            key = parts[1]
-            decision = parts[2]
-            asyncio.create_task(handle_approval_action(key, decision, user_openid, None, msg_id))
-            return
-
+    # 命令处理
     if content.strip().lower() in ["/new", "/reset", "/清空", "/新对话"]:
         logger.info("[Recv] New session command received")
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
-        )
-        await proc.communicate()
-        await asyncio.sleep(1)
-        proc2 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "q", ""
-        )
-        await proc2.communicate()
-        await asyncio.sleep(1)
-        cmd = f"script -q -c 'agy --dangerously-skip-permissions' /dev/null"
-        proc3 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"
-        )
-        await proc3.communicate()
-        await asyncio.sleep(3)
         
-        proc4 = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
-        )
-        await proc4.communicate()
-        await asyncio.sleep(1)
+        # 1. 强杀 tmux s0
+        proc_kill = await asyncio.create_subprocess_shell(f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true")
+        await proc_kill.communicate()
+        await asyncio.sleep(0.5)
         
-        reply = "✅ 已开启新会话，上下文已清空并自动关闭初始验证弹窗。"
+        # 2. 强建 tmux s0
+        proc_new = await asyncio.create_subprocess_exec("tmux", "new-session", "-d", "-s", TMUX_SESSION)
+        await proc_new.communicate()
+        await asyncio.sleep(2.0)
+        
+        # 3. 启动 AGY
+        proc_start = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, AGY_START_CMD, "Enter"
+        )
+        await proc_start.communicate()
+
+        # 4. 确认信任提示
+        await asyncio.sleep(4.0)
+        proc_enter = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
+        )
+        await proc_enter.communicate()
+        
+        reply = "✅ 已强杀并重建 tmux 会话，重新拉起全新 AGY。上下文已完全重置。"
         await send_message_rest(user_openid, reply)
         return
 
     if content.strip().lower() in ["/stop", "/停止", "/kill"]:
         logger.info("[Recv] Stop command received")
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, "C-c", ""
-        )
-        await proc.communicate()
-        reply = "⛔ 已发送终止信号。"
+        for key in ["C-c", "Enter", "C-c"]:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", TMUX_SESSION, key, ""
+            )
+            await proc.communicate()
+            await asyncio.sleep(0.3)
+        reply = "⛔ 已发送终止信号并尝试恢复命令行。"
         await send_message_rest(user_openid, reply)
-        return
-
-    if _processing:
-        await send_message_rest(user_openid, "⚠️ 当前已有任务正在执行中，请稍候。")
         return
 
     logger.info(f"[QQ -> AGY] {content}")
-
-    _processing = True
-    try:
-        await send_message_rest(user_openid, "⏳ AGY 正在思考...")
-        await send_to_agy(content)
-        reply = await wait_for_agy_response(timeout=300, user_openid=user_openid)
-        if not reply:
-            reply = "[AGY 无回复]"
-    except Exception as e:
-        reply = f"[AGY error] {str(e)[:300]}"
-        logger.error(f"Error processing message: {e}")
-    finally:
-        _processing = False
-
-    logger.info(f"[AGY -> QQ] {reply[:200]}")
-    success = await send_message_rest(user_openid, reply)
-    if not success:
-        logger.error("Reply send failed")
-
-
-async def handle_approval_action(key: str, decision: str, user_openid: str, group_openid: Optional[str] = None, msg_id: Optional[str] = None) -> bool:
-    global _current_approval_key, _processing
-
-    if not _current_approval_key or key != _current_approval_key:
-        logger.warning(f"Key mismatch: received {key}, current is {_current_approval_key}")
-        feedback = "⚠️ 审批卡片已失效或非最新请求。"
-        if group_openid:
-            await send_group_message_rest(group_openid, feedback, reply_to=msg_id)
-        else:
-            await send_message_rest(user_openid, feedback)
-        return False
-
-    logger.info(f"Processing approval: decision={decision} for key={key}")
-
-    keystroke = None
-    if decision == "allow":
-        keystroke = "y"
-    elif decision == "allow_similar":
-        keystroke = "a"
-    elif decision == "allow_always":
-        keystroke = "p"
-    elif decision == "deny":
-        keystroke = "n"
-
-    if not keystroke:
-        logger.error(f"Unknown decision type: {decision}")
-        return False
-
-    _current_approval_key = None
-
-    _processing = True
-    try:
-        feedback = f"✅ 已确认操作：[{decision}]，正在提交执行，请稍候..."
-        if group_openid:
-            await send_group_message_rest(group_openid, feedback, reply_to=msg_id)
-        else:
-            await send_message_rest(user_openid, feedback)
-
-        await send_to_agy(keystroke)
-        reply = await wait_for_agy_response()
-        if reply == "__APPROVAL_REQUIRED__":
-            reply = "⚠️ AGY 正在等待审批，请在终端确认后重新发送消息。"
-        if not reply:
-            reply = "[AGY 无回复]"
-    except Exception as e:
-        reply = f"[AGY error] {str(e)[:300]}"
-        logger.error(f"Error handling approval action: {e}")
-    finally:
-        _processing = False
-
-    if group_openid:
-        await send_group_message_rest(group_openid, reply, reply_to=msg_id)
-    else:
-        await send_message_rest(user_openid, reply)
-
-    return True
-
-
-async def handle_interaction(d: dict):
-    interaction_id = d.get("id")
-    if not interaction_id:
-        return
-
-    token = await ensure_token()
-    client = get_http_client()
-    try:
-        resp = await client.put(
-            f"{API_BASE}/interactions/{interaction_id}",
-            headers={
-                "Authorization": f"QQBot {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "AGY-QQ-Bridge/1.0",
-            },
-            json={"code": 0},
-            timeout=5.0,
-        )
-        logger.info(f"[Interaction] ACK status: {resp.status_code}")
-    except Exception as e:
-        logger.error(f"[Interaction] ACK exception: {e}")
-
-    author = d.get("author") or {}
-    user_openid = d.get("user_openid") or author.get("user_openid")
-    if not user_openid:
-        user_openid = author.get("member_openid")
-
-    if user_openid != MASTER_OPENID:
-        logger.warning(f"[Interaction] Unauthorized click from {user_openid}")
-        return
-
-    data_block = d.get("data", {})
-    button_data = data_block.get("button_data", "")
-    if button_data.startswith("approve:"):
-        parts = button_data.split(":")
-        if len(parts) >= 3:
-            key = parts[1]
-            decision = parts[2]
-            group_openid = d.get("group_openid")
-            msg_id = d.get("id")
-            asyncio.create_task(handle_approval_action(key, decision, user_openid, group_openid, msg_id))
-
-
-async def _heartbeat_sender(ws, interval: float):
-    try:
-        while _running and ws and not ws.closed:
-            await asyncio.sleep(interval)
-            if ws and not ws.closed:
-                await ws.send_json({"op": 1, "d": _last_seq})
-                logger.debug("Heartbeat sent")
-    except asyncio.CancelledError:
-        return
-    except Exception as e:
-        logger.debug(f"Heartbeat error: {e}")
+    # 直接发送，不等待，不阻塞
+    await send_to_agy(content)
 
 
 async def event_loop(ws):
     global _session_id, _last_seq, _running, _ws, heartbeat_task
     _ws = ws
     heartbeat_interval = HEARTBEAT_INTERVAL
-    heartbeat_task = None
-
     heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, heartbeat_interval))
 
     try:
         while _running and ws and not ws.closed:
             msg = await ws.receive()
-
             if msg.type == 1:
                 try:
                     payload = json.loads(msg.data)
@@ -885,14 +451,6 @@ async def event_loop(ws):
                     elif t == "C2C_MESSAGE_CREATE":
                         task = asyncio.create_task(handle_c2c_message(d))
                         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                    elif t in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
-                        task = asyncio.create_task(handle_group_message(d, t))
-                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                    elif t == "INTERACTION_CREATE":
-                        task = asyncio.create_task(handle_interaction(d))
-                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-                    else:
-                        logger.debug(f"Unhandled event: {t}")
                     continue
 
             elif msg.type == 9:
@@ -903,9 +461,25 @@ async def event_loop(ws):
         logger.error(f"Event loop error: {e}")
 
 
+async def _heartbeat_sender(ws, interval: float):
+    try:
+        while _running and ws and not ws.closed:
+            await asyncio.sleep(interval)
+            if ws and not ws.closed:
+                await ws.send_json({"op": 1, "d": _last_seq})
+                logger.debug("Heartbeat sent")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.debug(f"Heartbeat error: {e}")
+
+
 async def main():
     global _running
     _running = True
+
+    # 启动后台异步日志监听服务
+    asyncio.create_task(log_listener())
 
     try:
         gateway_url = await get_gateway_url()
