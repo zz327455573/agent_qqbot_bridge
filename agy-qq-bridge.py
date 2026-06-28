@@ -88,9 +88,10 @@ _last_msg_id: Optional[str] = None
 _bot_openid: str = ""
 heartbeat_task = None
 
-# === 异步监听状态变量 ===
+# === 异步监听状态 ===
 _last_log_size = 0
 _current_log_path = None
+_last_sent_timestamp = ""  # 记录最后发送给 QQ 的消息时间戳，防重与防历史刷屏
 
 
 def find_latest_transcript(min_mtime: float) -> Optional[Path]:
@@ -139,7 +140,7 @@ async def send_to_agy(message: str):
 
 async def log_listener():
     """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
-    global _current_log_path, _last_log_size
+    global _current_log_path, _last_log_size, _last_sent_timestamp
     
     # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
     init_log = find_latest_transcript(time.time() - 86400.0)
@@ -147,9 +148,25 @@ async def log_listener():
         _current_log_path = init_log
         try:
             _last_log_size = init_log.stat().st_size
+            # 扫描已有的历史日志，提取最新一条回复的时间戳，进行时间锁死防止历史刷屏
+            with open(init_log, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.read().splitlines()
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
+                        ts = obj.get("created_at")
+                        if ts:
+                            _last_sent_timestamp = ts
+                            break
+                except Exception:
+                    continue
         except OSError:
             _last_log_size = 0
-        logger.info(f"[Listener] Bound to existing active log: {_current_log_path} (size={_last_log_size})")
+        logger.info(f"[Listener] Bound to existing active log: {_current_log_path} (size={_last_log_size}, last_ts={_last_sent_timestamp})")
 
     while _running:
         await asyncio.sleep(0.5)
@@ -205,6 +222,11 @@ async def log_listener():
             
             # 只捕获模型返回的最终回复内容
             if obj.get("type") == "PLANNER_RESPONSE" and obj.get("source") == "MODEL":
+                ts = obj.get("created_at")
+                # 如果当前行的时间戳不大于已发送的时间戳，说明是重读的历史记录，直接跳过
+                if ts and _last_sent_timestamp and ts <= _last_sent_timestamp:
+                    continue
+                
                 content = obj.get("content", "")
                 if isinstance(content, list):
                     text = "\n".join(
@@ -215,7 +237,9 @@ async def log_listener():
                     text = str(content)
                 text = text.strip()
                 if text:
-                    logger.info(f"[Listener -> QQ] Broadcasting response: {text[:100]}")
+                    logger.info(f"[Listener -> QQ] Broadcasting response (ts={ts}): {text[:100]}")
+                    if ts:
+                        _last_sent_timestamp = ts
                     await send_message_rest(MASTER_OPENID, text)
 
 
