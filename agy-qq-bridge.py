@@ -174,6 +174,11 @@ async def log_listener():
             _current_log_path = None
             continue
 
+        # 针对日志文件被 AI 客户端自动截断/收缩导致的 log rotation 现象进行安全水位重置
+        if curr_size < _last_log_size:
+            logger.info(f"[Listener] Log file truncated (decreased from {_last_log_size} to {curr_size}), resetting offset.")
+            _last_log_size = 0
+
         if curr_size <= _last_log_size:
             continue
 
