@@ -251,7 +251,7 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
     headers = {
         "Authorization": f"QQBot {token}",
         "Content-Type": "application/json",
-        "User-Agent": "AGY-QQ-Bridge/1.0",
+        "User-Agent": "AGY-QQ-Bridge/2.0",
     }
     msg_seq = _next_msg_seq(user_openid)
     display_content = content[:3990] + "\n\n... (已截断)" if len(content) > 4000 else content
@@ -371,6 +371,16 @@ async def handle_c2c_message(d: dict):
         return
 
     content = str(d.get("content", "")).strip()
+    
+    # 提取附件 URL（图片、语音、视频、文件等），零截留原样透传
+    attachments = d.get("attachments") or []
+    for att in attachments:
+        url = att.get("url")
+        if url:
+            name = att.get("filename") or att.get("name") or "file"
+            content += f"\n\n[附件({name}): {url}]"
+            
+    content = content.strip()
     author = d.get("author") if isinstance(d.get("author"), dict) else {}
     user_openid = str(author.get("user_openid", ""))
 
