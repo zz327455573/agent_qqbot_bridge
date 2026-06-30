@@ -120,21 +120,21 @@ async def send_to_agy(message: str):
     logger.info(f"[Tmux Target] Sending keys to session: {TMUX_SESSION}")
     # 模拟按 Escape 强退可能卡在 TUI 或 PAGER 的状态
     proc_esc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Escape", ""
     )
     await proc_esc.communicate()
     await asyncio.sleep(0.5)
     
     # 写入消息
     proc_msg = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, message, ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", message, ""
     )
     await proc_msg.communicate()
     await asyncio.sleep(0.1)
     
     # 按回车执行
     proc_enter = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Enter", ""
     )
     await proc_enter.communicate()
     logger.info(f"[Bridge -> AGY] {message[:100]}")
