@@ -142,7 +142,7 @@ async def send_to_agy(message: str):
 
 async def log_listener():
     """纯异步增量日志广播协程：无脑在后台读取最新修改日志的增量并推送到 QQ。"""
-    global _current_log_path, _last_log_size, _last_sent_timestamp
+    global _current_log_path, _last_log_size, _last_sent_timestamp, _last_typing_sent_time
     
     # 启动时，先扫描并绑定目前最新的日志（以当前 24 小时前为基线）
     init_log = find_latest_transcript(time.time() - 86400.0)
