@@ -85,6 +85,7 @@ _ws = None
 _http_client = None
 _running = False
 _last_msg_id: Optional[str] = None
+_last_typing_sent_time = 0.0  # 记录上次发送“正在输入”通知的时间戳
 _bot_openid: str = ""
 heartbeat_task = None
 
@@ -200,6 +201,12 @@ async def log_listener():
         if curr_size <= _last_log_size:
             continue
 
+        # 触发/续杯“正在输入中”的顶部状态
+        now = time.time()
+        if _last_msg_id and (now - _last_typing_sent_time > 5.0):
+            asyncio.create_task(send_input_notify(MASTER_OPENID, _last_msg_id))
+            _last_typing_sent_time = now
+
         # 3. 增量读取新行
         try:
             with open(_current_log_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -268,6 +275,37 @@ async def send_message_rest(user_openid: str, content: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Send exception: {e}")
+        return False
+
+
+async def send_input_notify(user_openid: str, msg_id: str) -> bool:
+    """给指定用户发送“正在输入”通知状态（msg_type: 6）"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "AGY-QQ-Bridge/2.0",
+    }
+    msg_seq = _next_msg_seq(user_openid)
+    body = {
+        "msg_type": 6,
+        "input_notify": {"input_type": 1, "input_second": 10},
+        "msg_seq": msg_seq,
+        "msg_id": msg_id,
+    }
+
+    try:
+        resp = await client.post(
+            f"{API_BASE}/v2/users/{user_openid}/messages",
+            headers=headers, json=body, timeout=30.0,
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Typing notify failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Typing notify exception: {e}")
         return False
 
 
@@ -440,6 +478,8 @@ async def handle_c2c_message(d: dict):
     logger.info(f"[QQ -> AGY] {content}")
     # 直接发送，不等待，不阻塞
     await send_to_agy(content)
+    # 立即触发一次“正在输入中”的状态
+    await send_input_notify(user_openid, msg_id)
 
 
 async def event_loop(ws):
